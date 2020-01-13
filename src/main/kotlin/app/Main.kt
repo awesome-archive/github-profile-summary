@@ -1,93 +1,61 @@
 package app
 
-import app.util.Heroku
-import app.util.RateLimitUtil
 import io.javalin.Javalin
-import io.javalin.core.util.Header
-import io.javalin.embeddedserver.jetty.websocket.WsSession
-import io.javalin.translator.template.TemplateUtil.model
-import org.apache.commons.lang.StringEscapeUtils.escapeHtml
-import org.eclipse.egit.github.core.client.RequestException
+import io.javalin.core.compression.Brotli
+import io.javalin.core.compression.Gzip
+import io.javalin.http.BadRequestResponse
+import io.javalin.http.NotFoundResponse
+import io.javalin.http.util.RateLimit
+import io.javalin.plugin.rendering.vue.VueComponent
+import org.eclipse.jetty.server.Server
+import org.eclipse.jetty.server.ServerConnector
+import org.eclipse.jetty.util.thread.QueuedThreadPool
 import org.slf4j.LoggerFactory
-import java.util.*
+import java.util.concurrent.TimeUnit
 
-fun main(args: Array<String>) {
+fun main() {
 
     val log = LoggerFactory.getLogger("app.MainKt")
-
-    val unrestricted = Config.getUnrestrictedState()?.toBoolean() ?: false
-
-    val app = Javalin.create().apply {
-        port(Config.getPort() ?: 7070)
-        enableStandardRequestLogging()
-        enableDynamicGzip()
-    }
-
-    app.apply { // add routes
-
+    val app = Javalin.create {
+        it.enforceSsl = true
+        it.addStaticFiles("/public")
+        it.compressionStrategy(Brotli(), Gzip())
+        it.server {
+            Server(QueuedThreadPool(200, 8, 120000)).apply {
+                connectors = arrayOf(ServerConnector(server).apply {
+                    port = Config.getPort() ?: 7070
+                    idleTimeout = 120_000
+                })
+            }
+        }
+    }.apply {
+        before("/api/*") { RateLimit(it).requestPerTimeUnit(20, TimeUnit.MINUTES) }
+        get("/api/can-load") { ctx ->
+            val user = ctx.queryParam<String>("user").get()
+            if (!UserService.userExists(user)) throw NotFoundResponse()
+            ctx.status(if (UserService.canLoadUser(user)) 200 else 400)
+        }
         get("/api/user/:user") { ctx ->
-            val user = ctx.param("user")!!
-            when (UserCtrl.hasStarredRepo(user) || unrestricted) {
-                true -> ctx.json(UserCtrl.getUserProfile(ctx.param("user")!!))
-                false -> ctx.status(400)
-            }
+            val user = ctx.pathParam("user")
+            if (!UserService.userExists(user)) throw NotFoundResponse()
+            if (!UserService.canLoadUser(user)) throw BadRequestResponse("Can't load user")
+            ctx.json(UserService.getUserProfile(user))
         }
-
-        get("/user/:user") { ctx ->
-            val user = ctx.param("user")!!
-            when (UserCtrl.hasStarredRepo(user) || unrestricted) {
-                true -> ctx.renderVelocity("user.vm", model("user", user))
-                false -> ctx.redirect("/search?q=$user")
-            }
-        }
-
-        get("/search") { ctx ->
-            val user = ctx.queryParam("q") ?: ""
-            when (UserCtrl.hasStarredRepo(user) || (unrestricted && user != "")) {
-                true -> ctx.redirect("/user/$user")
-                false -> ctx.renderVelocity("search.vm", model("q", escapeHtml(user)))
-            }
-        }
-
+        get("/search", VueComponent("<search-view></search-view>"))
+        get("/user/:user", VueComponent("<user-view></user-view>"))
         ws("/rate-limit-status") { ws ->
-            ws.onConnect { session -> Timer().scheduleAtFixedRate(reportRemainingRequests(session), 0, 1000) }
+            ws.onConnect { GhService.registerClient(it) }
+            ws.onClose { GhService.unregisterClient(it) }
+            ws.onError { GhService.unregisterClient(it) }
         }
+        after { it.cookie("gtm-id", Config.getGtmId() ?: "") }
+    }.exception(Exception::class.java) { e, ctx ->
+        log.warn("Uncaught exception", e)
+        ctx.status(500)
+    }.error(404, "html") {
+        it.redirect("/search")
+    }.start()
 
-    }
+    UserService.syncWatchers()
 
-    app.apply { // add exception/error handlers
-
-        exception(Exception::class.java) { e, ctx ->
-            log.warn("Uncaught exception", e)
-            ctx.status(500)
-        }
-
-        exception(RequestException::class.java) { e, ctx ->
-            if (e.message == "Not Found (404)") {
-                ctx.status(404)
-            }
-        }
-
-        error(404) { ctx ->
-            if (ctx.header(Header.ACCEPT)?.contains("application/json") == false) {
-                ctx.redirect("/search")
-            }
-        }
-
-    }
-
-    RateLimitUtil.enableTerribleRateLimiting(app)
-    Heroku.enableSslRedirect(app)
-
-    app.start()
-
-}
-
-private fun reportRemainingRequests(session: WsSession) = object : TimerTask() {
-    override fun run() {
-        if (session.isOpen) {
-            return session.send(GhService.remainingRequests.toString())
-        }
-        this.cancel()
-    }
 }

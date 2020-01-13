@@ -1,20 +1,24 @@
 package app
 
+import io.javalin.websocket.WsContext
 import org.eclipse.egit.github.core.client.GitHubClient
 import org.eclipse.egit.github.core.service.CommitService
 import org.eclipse.egit.github.core.service.RepositoryService
 import org.eclipse.egit.github.core.service.UserService
 import org.eclipse.egit.github.core.service.WatcherService
 import org.slf4j.LoggerFactory
-import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 object GhService {
 
+    // https://javadoc.io/doc/org.eclipse.mylyn.github/org.eclipse.egit.github.core/2.1.5
+
     private val log = LoggerFactory.getLogger(GhService.javaClass)
 
     private val tokens = Config.getApiTokens()?.split(",") ?: listOf("") // empty token is limited to 60 requests
-    private val clients = tokens.map { token -> GitHubClient().apply { setOAuth2Token(token) } }
+    private val clients = tokens.map { GitHubClient().apply { setOAuth2Token(it) } }
     private val repoServices = clients.map { RepositoryService(it) }
     private val commitServices = clients.map { CommitService(it) }
     private val userServices = clients.map { UserService(it) }
@@ -27,14 +31,40 @@ object GhService {
 
     val remainingRequests: Int get() = clients.sumBy { it.remainingRequests }
 
-    init { // create timer to ping clients every other minute to make sure remainingRequests is correct
-        Timer().scheduleAtFixedRate(object : TimerTask() {
-            override fun run() {
-                repoServices.forEach { it.getRepository("tipsy", "github-profile-summary") }
-                repoServices.forEach { log.info("Pinged client ${clients.indexOf(it.client)} - client.remainingRequests was ${it.client.remainingRequests}") }
-            }
-        }, 0, TimeUnit.MILLISECONDS.convert(2, TimeUnit.MINUTES))
+    // Allows for parallel iteration and O(1) put/remove
+    private val clientSessions = ConcurrentHashMap<WsContext, Boolean>()
+
+    fun registerClient(ws: WsContext) = clientSessions.put(ws, true) == true
+    fun unregisterClient(ws: WsContext) = clientSessions.remove(ws) == true
+
+    init {
+        Executors.newScheduledThreadPool(2).apply {
+
+            // ping clients every other minute to make sure remainingRequests is correct
+            scheduleAtFixedRate({
+                repoServices.forEach {
+                    try {
+                        it.getRepository("tipsy", "profile-summary-for-github")
+                        log.info("Pinged client ${clients.indexOf(it.client)} - client.remainingRequests was ${it.client.remainingRequests}")
+                    } catch (e: Exception) {
+                        log.info("Pinged client ${clients.indexOf(it.client)} - was rate-limited")
+                    }
+                }
+            }, 0, 2, TimeUnit.MINUTES)
+
+            // update all connected clients with remainingRequests twice per second
+            scheduleAtFixedRate({
+                val remainingRequests = remainingRequests.toString()
+                clientSessions.forEachKey(1) {
+                    try {
+                        it.send(remainingRequests)
+                    } catch (e: Exception) {
+                        log.error(e.toString())
+                    }
+                }
+            }, 0, 500, TimeUnit.MILLISECONDS)
+
+        }
     }
 
 }
-
